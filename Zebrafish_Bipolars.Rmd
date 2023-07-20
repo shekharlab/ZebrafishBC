@@ -1,0 +1,399 @@
+---
+title: "R Notebook"
+output:
+  word_document: default
+  html_notebook: default
+---
+
+# Load libraries
+```{r}
+library(tidyverse)
+library(Seurat)
+library(ggplot2)
+library(pvclust)
+library(RColorBrewer)
+source("utils/utilFxns.R")
+source("utils/plottingFxns.R")
+source("utils/xgboost_train.R")
+```
+
+
+# Zfish Bipolar Type Annotation
+## Prepare velocyto data
+```{r}
+data_dir <- "/Users/joshhahn/Google Drive File Stream/My Drive/shekharlab_data/projects/Zebrafish/Loom/Bipolar/"
+ZfishBC1 <- read.loom.matrices(file = paste0(data_dir, "ZfishBC1/possorted_genome_bam_OQDY2.loom"), engine = "hdf5r")
+ZfishBC2 <- read.loom.matrices(file = paste0(data_dir, "ZfishBC2/possorted_genome_bam_TIPBO.loom"), engine = "hdf5r")
+ZfishBC3 <- read.loom.matrices(file = paste0(data_dir, "ZfishBC3/possorted_genome_bam_S06NP.loom"), engine = "hdf5r")
+ZfishBC4 <- read.loom.matrices(file = paste0(data_dir, "ZfishBC4/possorted_genome_bam_S557J.loom"), engine = "hdf5r")
+ZfishBC5 <- read.loom.matrices(file = paste0(data_dir, "ZfishBC5/possorted_genome_bam_QFA52.loom"), engine = "hdf5r")
+ZfishBC6 <- read.loom.matrices(file = paste0(data_dir, "ZfishBC6/possorted_genome_bam_AC7O9.loom"), engine = "hdf5r")
+ZfishBC7 <- read.loom.matrices(file = paste0(data_dir, "ZfishBC7/possorted_genome_bam_7JH2I.loom"), engine = "hdf5r")
+ZfishBC8 <- read.loom.matrices(file = paste0(data_dir, "ZfishBC8/possorted_genome_bam_MROMJ.loom"), engine = "hdf5r")
+```
+
+Add introns and exons and combine matrices
+```{r}
+ZfishBC1_mat <- ZfishBC1$spliced + ZfishBC1$unspliced
+ZfishBC2_mat <- ZfishBC2$spliced + ZfishBC2$unspliced
+ZfishBC3_mat <- ZfishBC3$spliced + ZfishBC3$unspliced
+ZfishBC4_mat <- ZfishBC4$spliced + ZfishBC4$unspliced
+ZfishBC5_mat <- ZfishBC5$spliced + ZfishBC5$unspliced
+ZfishBC6_mat <- ZfishBC6$spliced + ZfishBC6$unspliced
+ZfishBC7_mat <- ZfishBC7$spliced + ZfishBC7$unspliced
+ZfishBC8_mat <- ZfishBC8$spliced + ZfishBC8$unspliced
+
+Zebrafish_mat <- cbind(ZfishBC1_mat, ZfishBC2_mat, ZfishBC3_mat, ZfishBC4_mat, ZfishBC5_mat, ZfishBC6_mat, ZfishBC7_mat, ZfishBC8_mat)
+```
+
+Create Seurat object
+```{r}
+Zebrafish <- CreateSeuratObject(Zebrafish_mat, names.delim = ":")
+
+Zebrafish@meta.data[colnames(ZfishBC1_mat), 'orig.file'] = "ZfishBC1"
+Zebrafish@meta.data[colnames(ZfishBC2_mat), 'orig.file'] = "ZfishBC2"
+Zebrafish@meta.data[colnames(ZfishBC3_mat), 'orig.file'] = "ZfishBC3"
+Zebrafish@meta.data[colnames(ZfishBC4_mat), 'orig.file'] = "ZfishBC4"
+Zebrafish@meta.data[colnames(ZfishBC5_mat), 'orig.file'] = "ZfishBC5"
+Zebrafish@meta.data[colnames(ZfishBC6_mat), 'orig.file'] = "ZfishBC6"
+Zebrafish@meta.data[colnames(ZfishBC7_mat), 'orig.file'] = "ZfishBC7"
+Zebrafish@meta.data[colnames(ZfishBC8_mat), 'orig.file'] = "ZfishBC8"
+```
+
+Initial quality control metrics
+```{r}
+VlnPlot(Zebrafish, features = "nCount_RNA", pt.size = 0, group.by = "orig.file")
+VlnPlot(Zebrafish, features = "nFeature_RNA", pt.size = 0, group.by = "orig.file")
+```
+
+
+## Perform initial clustering
+Perform initial clustering
+```{r}
+Zfish_BC <- subset(Zebrafish, subset = nCount_RNA < 2500 & nFeature_RNA > 50)
+Zfish_BC <- ClusterSeurat(Zfish_BC)
+```
+
+Visualize initial clusters
+```{r}
+DimPlot(Zfish_BC, label = TRUE)
+DimPlot(Zfish_BC, group.by = "orig.file", cells = sample(colnames(Zfish_BC)))
+VlnPlot(Zfish_BC, "nCount_RNA", pt.size = 0) + RotatedAxis() + NoLegend()
+VlnPlot(Zfish_BC, "nFeature_RNA", pt.size = 0) + RotatedAxis() + NoLegend()
+```
+
+Verify clusters correspond to bipolar cells
+```{r}
+RGC_markers= c("RBPMS2B", "POU6F2", "THY1", "SLC17A6", "ROBO2")
+BC_markers=c("CABP5A", "VSX1","VSX2","CABP5", "OTX2", "PRKCA", "GRIK1")
+AC_markers=c("TFAP2A","TFAP2B", "ONECUT2","GAD1", "GAD2", "SLC6A9")
+HC_markers=c("ONECUT1", "CALB1")
+PR_markers=c("PDE6H","ARR3A", "ARR3B", "RHO")
+MG_markers=c("APOEA", "APOEB","GLULA","GLULB","GLULC","RLBP1A", "RLBP1B", "CRABP1A", "CRABP1B", "DKK3A", "DKK3B", "CRYM", "C1QA", "C1QB")
+
+DotPlot(Zfish_BC, features = c(BC_markers, RGC_markers, AC_markers, HC_markers, PR_markers, MG_markers), assay = "RNA", group.by = "seurat_clusters") + RotatedAxis()
+```
+
+Calculate DE genes to see if any clusters should be removed / merged
+```{r}
+ZfishBC_markers <- FindAllMarkers(Zfish_BC, only.pos = TRUE, assay = "RNA")
+```
+
+Plot top DE genes
+```{r}
+Zfish_BC <- DendroOrder(Zfish_BC)
+Idents(Zfish_BC) <- "dendro_order"
+
+DotPlot(Zfish_BC, features = TopMarkers(Zfish_BC, markers = ZfishBC_markers, num_markers = 2), assay = "RNA", group.by = "dendro_order") + RotatedAxis()
+```
+
+Remove contaminant cell types
+```{r}
+# Cluster 23 is amacrine cells, SLC6A9, TFAP2A, TFAP2B
+print("Cluster 23 DE genes:")
+head(subset(ZfishBC_markers, cluster == 23), 10)$gene
+# Cluster 24 is amacrine cells
+print("Cluster 24 DE genes:")
+head(subset(ZfishBC_markers, cluster == 24), 10)$gene
+# Cluster 25 is rods
+print("Cluster 25 DE genes:")
+head(subset(ZfishBC_markers, cluster == 25), 10)$gene
+# Questionable: 3 and 5 express GLULA specifically, but retain bipolar markers
+print("Cluster 3 DE genes:")
+head(subset(ZfishBC_markers, cluster == 3), 10)$gene
+
+
+# Remove clusters 23,24,25
+Zfish_BC <- DropClusters(Zfish_BC, idents = c(23, 24,25), refactor = TRUE)
+```
+
+
+## Visualize clusters
+```{r}
+DimPlot(Zfish_BC, label = TRUE)
+DimPlot(Zfish_BC, group.by = "orig.file", cells = sample(colnames(Zfish_BC)))
+VlnPlot(Zfish_BC, "nCount_RNA", pt.size = 0) + RotatedAxis() + NoLegend()
+VlnPlot(Zfish_BC, "nFeature_RNA", pt.size = 0) + RotatedAxis() + NoLegend()
+```
+
+Verify clusters correspond to bipolar cells
+```{r}
+RGC_markers= c("RBPMS2B", "POU6F2", "THY1", "ROBO2")
+BC_markers=c("CABP5A", "VSX1","VSX2", "OTX2", "PRKCA")
+AC_markers=c("TFAP2A","TFAP2B", "ONECUT2", "GAD2", "SLC6A9")
+HC_markers=c("ONECUT1", "CALB1")
+PR_markers=c("PDE6H","ARR3A", "ARR3B", "RHO")
+MG_markers=c("APOEA", "APOEB","GLULA","GLULB","GLULC","RLBP1A", "RLBP1B", "CRABP1A", "CRABP1B", "DKK3A", "DKK3B", "CRYM", "C1QA", "C1QB")
+
+DotPlot(Zfish_BC, features = c(BC_markers, RGC_markers, AC_markers, HC_markers, PR_markers, MG_markers), assay = "RNA", group.by = "seurat_clusters") + RotatedAxis()
+```
+
+```{r}
+saveRDS(Zfish_BC, "Objects/ZebrafishBC_v3.rds")
+```
+
+
+# Annotate Rod, Cone On, Cone Off
+```{r}
+Zfish_BC <- readRDS("Objects/ZebrafishBC_v3.rds")
+
+pan_BC <- c("VSX1", "CABP5A")
+Rod <- c("PRKCA.1", "GRAMD1B")
+Cone <- c("SLC24A3", "APBA2B")
+Off <- c("GRIK1A", "GRIK1B")
+On <- c("GRM6A","GRM6B", "ISL1", "GNB3A")
+
+DotPlot(Zfish_BC, features = c(pan_BC, Rod, Cone, Off, On), assay = "RNA") + RotatedAxis()
+```
+
+## Factor by rod, On cone, off cone
+```{r}
+Idents(Zfish_BC) <- "seurat_clusters"
+
+Zfish_BC@meta.data$bipolar_order = factor(Idents(Zfish_BC), levels = rev(c(14,19,1,7,8,9,16,17,18,22,23,2,3,4,5,6,10,11,12,13,15,20,21)))
+
+Zfish_BC@meta.data$type <- "OFF Cone"
+Zfish_BC@meta.data[WhichCells(Zfish_BC, idents = c(14,19)), "type"] <- "Rod Bipolar"
+Zfish_BC@meta.data[WhichCells(Zfish_BC, idents = c(1,7,8,9,16,17,18,22,23)), "type"] <- "ON Cone"
+```
+
+
+## Cluster 19: Rod bipolar or not?
+Calculate DE  markers
+```{r}
+Idents(Zfish_BC) <- "seurat_clusters"
+cluster_markers <- FindAllMarkers(Zfish_BC, assay = "RNA", only.pos = TRUE, test.use = "MAST")
+```
+
+```{r}
+DotPlot(Zfish_BC, features = TopMarkers(cluster_markers, num_markers = 2)) + RotatedAxis()
+
+clus19_markers <- subset(cluster_markers, cluster == 19)
+clus14_markers <- subset(cluster_markers, cluster == 14)
+
+mark19 <- head(clus19_markers$gene, 20)
+mark14 <- head(clus14_markers$gene, 20)
+common_mark <- intersect(mark19, mark14)
+
+mark19 <- mark19[!(mark19 %in% common_mark)]
+mark14 <- mark14[!(mark14 %in% common_mark)]
+
+DotPlot(Zfish_BC, features = c(mark19, mark14, common_mark), assay = "RNA", group.by = "bipolar_order") + RotatedAxis()
+```
+
+
+```{r}
+# Set testing parameters
+greater_than = .4
+less_than = .2
+# Do a DE test with combined group 19 and 14, compare to combined group 14 and 7, a cluster proximal to 14 on the dendrogram
+markers14_19 <- FindMarkers(Zfish_BC, ident.1 = c(14,19), assay = "RNA", test.use = "MAST")
+
+# Sort genes that appear in each cluster, but do not appear in other clusters
+markers14_19 <- markers14_19[order(-markers14_19$avg_log2FC), ]
+
+markers_pass <- names(which(tfPercentExpression(Zfish_BC, clusID = 14, tf = rownames(markers14_19)) > greater_than))
+markers_pass <- names(which(tfPercentExpression(Zfish_BC, clusID = 19, tf = markers_pass) > greater_than))
+for(i in levels(Idents(Zfish_BC))){
+  if(i == 14 || i == 19){}
+  else{
+    markers_pass <- names(which(tfPercentExpression(Zfish_BC, clusID = i, tf = markers_pass) < less_than))
+  }
+}
+
+DotPlot(Zfish_BC, features = markers_pass, assay = "RNA", group.by = "bipolar_order") + RotatedAxis()
+```
+
+Repeat for clusters 14 and 7
+```{r}
+# Set testing parameters
+greater_than = .4
+less_than = .2
+# Do a DE test with combined group 19 and 14, compare to combined group 14 and 7, a cluster proximal to 14 on the dendrogram
+markers14_7 <- FindMarkers(Zfish_BC, ident.1 = c(14,7), assay = "RNA", test.use = "MAST")
+
+# Sort genes that appear in each cluster, but do not appear in other clusters
+markers14_7 <- markers14_7[order(-markers14_7$avg_log2FC), ]
+
+markers_pass <- names(which(tfPercentExpression(Zfish_BC, clusID = 14, tf = rownames(markers14_7)) > greater_than))
+markers_pass <- names(which(tfPercentExpression(Zfish_BC, clusID = 7, tf = markers_pass) > greater_than))
+
+for(i in levels(Idents(Zfish_BC))){
+  if(i == 14 || i == 7){}
+  else{
+    markers_pass <- names(which(tfPercentExpression(Zfish_BC, clusID = i, tf = markers_pass) < less_than))
+  }
+}
+
+```
+
+
+# Dendrograms
+```{r}
+dendro_list <- list()
+nfeatures <- c(100, 500, 1000, 2000)
+for(i in 1:4){
+  test <- FindVariableFeatures(Zfish_BC, selection.method = "vst", nfeatures = nfeatures[i])
+  test <- BuildClusterTree(test)
+  plot(test@tools$BuildClusterTree, main = paste0("Features: ", nfeatures[i]))
+}
+```
+
+New dendrogram, based on correlation distance
+```{r}
+n = 2000
+
+Zfish_BC <- FindVariableFeatures(Zfish_BC, nfeatures = n, selection.method = "vst")
+feature_set <- VariableFeatures(Zfish_BC)
+
+# Compute average gene expression matrix
+data.avg <- AverageExpression(object = Zfish_BC, assays = "RNA", 
+      features = feature_set, verbose = FALSE, return.seurat = TRUE)
+data.avg <- as.data.frame(data.avg@assays$RNA@data)
+  
+# Compute hierarchical tree 
+dendro <- pvclust(data.avg, method.hclust = "complete", method.dist = "correlation", nboot = 10000)
+
+# Plot the tree
+plot(dendro, main = "Zebrafish Bipolars")
+```
+
+
+
+# Figures
+## UMAP
+```{r}
+Zfish_BC <- readRDS("Objects/ZebrafishBC_v3.rds")
+
+Zfish_BC@meta.data$plot <- factor(Zfish_BC@meta.data$seurat_clusters, levels = c(14,19,3,13,4,6,11,10,15,22,20,21,23,8,9,17,18,1,7,16,5,2,12))
+
+
+pdf("Figures/UMAP.pdf", w=5, h=5, useDingbats = FALSE)
+DimPlot(Zfish_BC, label = TRUE, group.by = "plot", cols = c("#0085CC", "#00A6CC", "#FF2A00", "#FF5C00", "#FF9B00", "#FFCD00", "#FFE100", "#CDB900", "#8AA200", "#FF00FF", "#8AC300", "#8AED00", "#C100FF", "#7801FF", "#4900B7", "#8C7BFF", "#BE53FF", "#DA88AD", "#FF97AD", "#FFC6AD", "#5DFF00", "#0BD200", "#006900")) + NoLegend() + ggtitle(NULL)
+dev.off()
+
+```
+
+```{r}
+Zfish_BC <- readRDS("Objects/ZebrafishBC_v3.rds")
+
+pdf("Figures/UMAP_recolored.pdf", w=5, h=5, useDingbats = FALSE)
+DimPlot(Zfish_BC, group.by = "type", label = FALSE, cols = c("#73CAFF", "#D3A2FF", "#E78100")) + NoLegend() + ggtitle(NULL)
+dev.off()
+```
+
+
+
+## Gene plots
+```{r}
+grm6_path <- toupper(c("Trpm1a", "Trpm1b", "Prkca", "Prkca.1", "Prkcba", "Prkcbb", "Prkcg", "Rgs7a", "Rgs7b", "Rgs11", "nyx"))
+Glut_trans <- toupper(c( "slc1a7b", "slc1a9"))
+Volt_chan <- toupper(c("Cacna1c", "Cacna1da", "Cacna1db", "Cacna1fa", "Cacna1fb"))
+Ca_bind <- toupper(c("Cabp5a", "Cabp5b"))
+
+
+pdf("Figures/Gene Dotplots/Grm6_pathway.pdf", w=5.5, h=6, useDingbats = FALSE)
+DotPlot(Zfish_BC, features = grm6_path, group.by = "bipolar_order") + RotatedAxis()
+dev.off()
+
+pdf("Figures/Gene Dotplots/Glutamate_transporters.pdf", w=4, h=6, useDingbats = FALSE)
+DotPlot(Zfish_BC, features = Glut_trans, group.by = "bipolar_order") + RotatedAxis()
+dev.off()
+
+pdf("Figures/Gene Dotplots/Voltage_gated_channels.pdf", w=5, h=6, useDingbats = FALSE)
+DotPlot(Zfish_BC, features = Volt_chan, group.by = "bipolar_order") + RotatedAxis()
+dev.off()
+
+pdf("Figures/Gene Dotplots/Ca_binding.pdf", w=4, h=6, useDingbats = FALSE)
+DotPlot(Zfish_BC, features = Ca_bind, group.by = "bipolar_order") + RotatedAxis()
+dev.off()
+
+
+```
+
+
+```{r}
+features <- c("GSG1L2A", "PCDH15A", "CBLN4", "ARHGAP24", "FAM163A.1", "RBP4", "NFIC", "PTPRUB", "NXPH1", "NXPH2B", "DHRS11A", "BHLHE22", "RGS4", "RERGLA", "IM:7152348", "FEZF2", "PDE6H.1", "SNAP25A", "NTNG1A", "CLSTN2.1", "TENM2", "ATP1A1B", "ABLIM1A", "SI:CH211-232M10.6", "IL13RA1", "FXYD6L", "SLC6A9", "SYT1A", "GRIFIN", "FNDC4", "FIBCD1", "SI:CH211-254N4.3", "HS3ST4", "DMBX1A", "SIX3A", "SI:CH211-67E16.11", "NME2A", "CALB2B", "PTPRT.1", "SLC4A11", "RDH10A", "UTS1", "S100A10B", "SYT5B")
+
+
+pdf("Figures/Cluster_markers.pdf", w=15, h=7, useDingbats = FALSE)
+DotPlot(Zfish_BC, features = features, group.by = "bipolar_order") + RotatedAxis()
+dev.off()
+```
+
+```{r}
+features <- c("RDH10A", "UTS1", "RLBP1B", "SMOX", "DACHA", "ANKRD9", "PAX6A", "IL1RAPL2", "PLK2A", "TSPAN18A", "PRKD3", "ID2A", "PLCL2", "CD82A", "ATP2B4", "ADCY8", "S100A10B", "SYT5B", "TRPM1B", "DGKAA", "GRM6A", "CALM3A", "CADPSA", "VSNL1A", "ATP2B3B", "PPP3CA", "GALNT18B", "PRKCA.1", "PXN", "SI:CH211-89F7.1", "GRM1B", "OCRL", "NRGNA", "SCG2B", "PTP4A3.1", "PLCH2A")
+
+
+pdf("Figures/C14_C19_markers.pdf", w=15, h=7, useDingbats = FALSE)
+DotPlot(Zfish_BC, features = features, group.by = "bipolar_order") + RotatedAxis()
+dev.off()
+```
+
+
+```{r}
+features <- c("GRM1B", "GRM6A", "GRM6B","GRM4", "GRM7", "GRM8A", "GRM8B","TRPM1A", "TRPM1B", "RGS11", "NYX")
+
+
+pdf("Figures/grm_markers.pdf", w=7, h=7, useDingbats = FALSE)
+DotPlot(Zfish_BC, features = features, group.by = "bipolar_order", cols = c("gray95", "black")) + RotatedAxis()
+dev.off()
+
+pdf("Figures/grm_markers_nodot.pdf", w=7, h=7, useDingbats = FALSE)
+DotPlot(Zfish_BC, features = features, group.by = "bipolar_order", cols = c("gray95", "black"), dot.min = .05) + RotatedAxis()
+dev.off()
+```
+
+
+## Percent Expression
+```{r}
+Zfish_BC <- readRDS("Objects/ZebrafishBC_v3.rds")
+Idents(Zfish_BC) <- "bipolar_order"
+genes <- c("CABP5A", "CABP5B", "CACNA1DA", "CACNA1DB", "CACNA1FA", "CACNA1FB")
+AverageExpression(Zfish_BC, assays = "RNA", features = genes )
+
+a <- DotPlot(object = Zfish_BC, features = genes, assay = "RNA", group.by = "bipolar_order") + RotatedAxis()
+
+write.csv(a$data, "Figures/Gene Dotplots/Ca_synpase_pct_exp.csv")
+```
+
+## Glutamate receptors
+```{r}
+GRM <- grep("^GRM", rownames(Zfish_BC), value = TRUE)
+GRIK <- grep("^GRIK", rownames(Zfish_BC), value = TRUE)
+GRIA <- grep("^GRIA", rownames(Zfish_BC), value = TRUE)
+GRIN <- grep("^GRIN", rownames(Zfish_BC), value = TRUE)
+all <- c(GRM, GRIK, GRIA, GRIN)
+highly <- c("GRM1B","GRM6A", "GRM6B", "GRIK1A","GRIN1B", "GRIN2CA")
+lowly <- all[!(all %in% highly)]
+
+DotPlot(Zfish_BC, features = c(GRM, GRIK, GRIA, GRIN), assay = "RNA", group.by = "bipolar_order") + RotatedAxis()
+
+DotPlot(Zfish_BC, features = highly, assay = "RNA", group.by = "bipolar_order") + RotatedAxis()
+DotPlot(Zfish_BC, features = lowly, assay = "RNA", group.by = "bipolar_order") + RotatedAxis()
+
+```
+
+
+
+
